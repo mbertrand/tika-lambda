@@ -2,12 +2,18 @@ package edu.mit.odl.open_lambda.tika;
 
 import java.io.IOException;
 import java.io.InputStream;
+
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.InputStreamReader;
 import java.io.StringWriter;
 import java.nio.charset.Charset;
 import java.net.URLDecoder;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
 import javax.xml.transform.OutputKeys;
 import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.sax.SAXTransformerFactory;
@@ -32,16 +38,66 @@ import com.amazonaws.services.s3.AmazonS3Client;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.event.S3EventNotification.S3EventNotificationRecord;
 import com.amazonaws.services.s3.model.GetObjectRequest;
+import com.amazonaws.services.s3.model.ObjectListing;
 import com.amazonaws.services.s3.model.PutObjectRequest;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 import com.amazonaws.services.s3.model.S3Object;
+import com.amazonaws.services.s3.model.S3ObjectInputStream;
+import com.amazonaws.services.s3.model.S3ObjectSummary;
+import com.amazonaws.util.StringUtils;
 
+import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
 
 public class TikaLambdaHandler implements RequestHandler<S3Event, String> {
 
     private LambdaLogger _logger;
 
+    private static String getAsString(InputStream is) throws IOException {
+        if (is == null)
+            return "";
+        StringBuilder sb = new StringBuilder();
+        try {
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(is, StringUtils.UTF8));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+        } finally {
+            is.close();
+        }
+        return sb.toString();
+    }    
+    
+    private void parseObjectText(String key, AmazonS3 s3Client, String bucket) {
+        // Object key may have spaces or unicode non-ASCII characters.
+
+        String extractBucket = bucket + "-extracts";
+
+        S3Object s3Object = s3Client.getObject(new GetObjectRequest(bucket, key));
+
+        try (InputStream objectData = s3Object.getObjectContent()) {
+            String extractJson = extractText(bucket, key, objectData);
+
+            byte[] extractBytes = extractJson.getBytes(Charset.forName("UTF-8"));
+            int extractLength = extractBytes.length;
+
+            ObjectMetadata metaData = new ObjectMetadata();
+            metaData.setContentLength(extractLength);
+
+            _logger.log("Saving extract file to S3");
+            InputStream inputStream = new ByteArrayInputStream(extractBytes);
+            s3Client.putObject(extractBucket, key + ".extract", inputStream, metaData);
+        }
+        catch (IOException | TransformerConfigurationException | SAXException  e) {
+            _logger.log("Exception: " + e.getLocalizedMessage());
+            throw new RuntimeException(e);
+        }        
+    }
+    
     public String handleRequest(S3Event s3event, Context context) {
         _logger = context.getLogger();
         _logger.log("Received S3 Event: " + s3event.toJson());
@@ -50,44 +106,45 @@ public class TikaLambdaHandler implements RequestHandler<S3Event, String> {
             S3EventNotificationRecord record = s3event.getRecords().get(0);
 
             String bucket = record.getS3().getBucket().getName();
-            String extractBucket = bucket + "-extracts";
 
-            // Object key may have spaces or unicode non-ASCII characters.
-            String key = URLDecoder.decode(record.getS3().getObject().getKey().replace('+', ' '), "UTF-8");
-            String extension = key.substring(key.lastIndexOf(".") + 1);
+            String json_key = URLDecoder.decode(record.getS3().getObject().getKey().replace('+', ' '), "UTF-8");
             
-            // Ignore files that won't have text in them
-            String[] extensions = {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "json", "html", "htm", "xml", "txt", "ps", "rtf"};
-            boolean containsExtension = Arrays.stream(extensions).anyMatch(extension::equals);
-            
-            if (!containsExtension) {
-              _logger.log("Ignoring extract file " + key);
-              return "Ignored";
-            }
-
             AmazonS3 s3Client = new AmazonS3Client();
-            S3Object s3Object = s3Client.getObject(new GetObjectRequest(bucket, key));
-            ObjectMetadata s3Metadata = s3Object.getObjectMetadata();
-            _logger.log(s3Metadata.getUserMetaDataOf("course_id"));
-            if (s3Metadata.getUserMetaDataOf("course_id") == null) {
-                _logger.log("Ignoring extract file " + key + "due to missing course_id in metadata");
-                return "Ignored";            	
+            S3Object masterJsonObject = s3Client.getObject(new GetObjectRequest(bucket, json_key));
+            S3ObjectInputStream s3Stream = masterJsonObject.getObjectContent();
+            JSONParser jsonParser = new JSONParser();
+            JSONObject s3Json =  (JSONObject)jsonParser.parse(new InputStreamReader(s3Stream, "UTF-8"));
+            
+            String courseUrl = s3Json.get("url").toString();
+            String coursePrefix = courseUrl.substring(courseUrl.lastIndexOf("/") + 1);
+            JSONArray courseFiles = (JSONArray) s3Json.get("course_files");
+            Iterator courseFilesIterator = courseFiles.iterator();
+            
+            while (courseFilesIterator.hasNext()) {
+            	Map courseFile = ((Map) courseFilesIterator.next());
+            	String s3ObjectPrefix = coursePrefix + "/" + courseFile.get("uid");
+            	ObjectListing listing = s3Client.listObjects(bucket, s3ObjectPrefix);
+            	List summaries = listing.getObjectSummaries();
+            	
+            	if (!summaries.isEmpty()) {
+            		String objectKey = ((S3ObjectSummary)summaries.get(0)).getKey();
+                    // Ignore files that won't have text in them
+            		objectKey = URLDecoder.decode(objectKey.replace('+', ' '), "UTF-8");
+                    String extension = objectKey.substring(objectKey.lastIndexOf(".") + 1);           		
+                    String[] extensions = {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "json", "html", "htm", "xml", "txt", "ps", "rtf"};
+                    boolean containsExtension = Arrays.stream(extensions).anyMatch(extension::equals);
+                    
+                    if (containsExtension) {
+                      _logger.log("Extract file " + objectKey);
+                      parseObjectText(objectKey, s3Client, bucket);
+                    }            		
+            	} else {
+            		_logger.log("No S3 objects w/prefix " + s3ObjectPrefix + " found.");
+            	}
+            	
             }
-
-            try (InputStream objectData = s3Object.getObjectContent()) {
-                String extractJson = extractText(bucket, key, objectData);
-
-                byte[] extractBytes = extractJson.getBytes(Charset.forName("UTF-8"));
-                int extractLength = extractBytes.length;
-
-                ObjectMetadata metaData = new ObjectMetadata();
-                metaData.setContentLength(extractLength);
-
-                _logger.log("Saving extract file to S3");
-                InputStream inputStream = new ByteArrayInputStream(extractBytes);
-                s3Client.putObject(extractBucket, key + ".extract", inputStream, metaData);
-            }
-        } catch (IOException | TransformerConfigurationException | SAXException e) {
+            
+        } catch (IOException | ParseException  e) {
             _logger.log("Exception: " + e.getLocalizedMessage());
             throw new RuntimeException(e);
         }
