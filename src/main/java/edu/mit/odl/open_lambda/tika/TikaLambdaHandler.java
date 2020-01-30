@@ -70,7 +70,7 @@ public class TikaLambdaHandler implements RequestHandler<S3Event, String> {
 			JSONObject extractJson = extractText(bucket, key, objectData);
 			String courseId = courseJSON.get("department_number") + "." + courseJSON.get("master_course_number");
 			extractJson.put("CourseId", courseId);
-			extractJson.put("RunId", courseJSON.get("_uid"));
+			extractJson.put("RunId", courseJSON.get("uid"));
 			extractJson.put("Title", fileJSON.get("title"));
 			extractJson.put("Description", fileJSON.get("description"));
 
