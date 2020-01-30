@@ -53,174 +53,189 @@ import org.json.simple.parser.ParseException;
 
 public class TikaLambdaHandler implements RequestHandler<S3Event, String> {
 
-    private LambdaLogger _logger;
+	private LambdaLogger _logger;
 
-    private static String getAsString(InputStream is) throws IOException {
-        if (is == null)
-            return "";
-        StringBuilder sb = new StringBuilder();
-        try {
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(is, StringUtils.UTF8));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
-            }
-        } finally {
-            is.close();
-        }
-        return sb.toString();
-    }    
-    
-    private void parseObjectText(String key, AmazonS3 s3Client, String bucket) {
-        // Object key may have spaces or unicode non-ASCII characters.
+	private void parseObjectText(AmazonS3 s3Client, String bucket, String key, JSONObject courseJSON,
+			Map<String, String> fileJSON) {
+		/*
+		 * Extract text from an S3 object, add attributes from course JSON, and put in
+		 * the extracted text bucket.
+		 */
 
-        String extractBucket = bucket + "-extracts";
+		String extractBucket = bucket + "-extracts";
 
-        S3Object s3Object = s3Client.getObject(new GetObjectRequest(bucket, key));
+		S3Object s3Object = s3Client.getObject(new GetObjectRequest(bucket, key));
 
-        try (InputStream objectData = s3Object.getObjectContent()) {
-            String extractJson = extractText(bucket, key, objectData);
+		try (InputStream objectData = s3Object.getObjectContent()) {
+			JSONObject extractJson = extractText(bucket, key, objectData);
+			String courseId = courseJSON.get("department_number") + "." + courseJSON.get("master_course_number");
+			extractJson.put("CourseId", courseId);
+			extractJson.put("RunId", courseJSON.get("_uid"));
+			extractJson.put("Title", fileJSON.get("title"));
+			extractJson.put("Description", fileJSON.get("description"));
 
-            byte[] extractBytes = extractJson.getBytes(Charset.forName("UTF-8"));
-            int extractLength = extractBytes.length;
+			byte[] extractBytes = extractJson.toJSONString().getBytes(Charset.forName("UTF-8"));
+			int extractLength = extractBytes.length;
 
-            ObjectMetadata metaData = new ObjectMetadata();
-            metaData.setContentLength(extractLength);
+			ObjectMetadata metaData = new ObjectMetadata();
+			metaData.setContentLength(extractLength);
 
-            _logger.log("Saving extract file to S3");
-            InputStream inputStream = new ByteArrayInputStream(extractBytes);
-            s3Client.putObject(extractBucket, key + ".extract", inputStream, metaData);
-        }
-        catch (IOException | TransformerConfigurationException | SAXException  e) {
-            _logger.log("Exception: " + e.getLocalizedMessage());
-            throw new RuntimeException(e);
-        }        
-    }
-    
-    public String handleRequest(S3Event s3event, Context context) {
-        _logger = context.getLogger();
-        _logger.log("Received S3 Event: " + s3event.toJson());
+			_logger.log("Saving extract file to S3");
+			InputStream inputStream = new ByteArrayInputStream(extractBytes);
+			s3Client.putObject(extractBucket, key + ".extract", inputStream, metaData);
+		} catch (IOException | TransformerConfigurationException | SAXException e) {
+			_logger.log("Exception: " + e.getLocalizedMessage());
+			throw new RuntimeException(e);
+		}
+	}
 
-        try {
-            S3EventNotificationRecord record = s3event.getRecords().get(0);
+	public String handleRequest(S3Event s3event, Context context) {
+		_logger = context.getLogger();
+		_logger.log("Received S3 Event: " + s3event.toJson());
 
-            String bucket = record.getS3().getBucket().getName();
+		try {
+			S3EventNotificationRecord record = s3event.getRecords().get(0);
 
-            String json_key = URLDecoder.decode(record.getS3().getObject().getKey().replace('+', ' '), "UTF-8");
-            
-            AmazonS3 s3Client = new AmazonS3Client();
-            S3Object masterJsonObject = s3Client.getObject(new GetObjectRequest(bucket, json_key));
-            S3ObjectInputStream s3Stream = masterJsonObject.getObjectContent();
-            JSONParser jsonParser = new JSONParser();
-            JSONObject s3Json =  (JSONObject)jsonParser.parse(new InputStreamReader(s3Stream, "UTF-8"));
-            
-            String courseUrl = s3Json.get("url").toString();
-            String coursePrefix = courseUrl.substring(courseUrl.lastIndexOf("/") + 1);
-            JSONArray courseFiles = (JSONArray) s3Json.get("course_files");
-            Iterator courseFilesIterator = courseFiles.iterator();
-            
-            while (courseFilesIterator.hasNext()) {
-            	Map courseFile = ((Map) courseFilesIterator.next());
-            	String s3ObjectPrefix = coursePrefix + "/" + courseFile.get("uid");
-            	ObjectListing listing = s3Client.listObjects(bucket, s3ObjectPrefix);
-            	List summaries = listing.getObjectSummaries();
-            	
-            	if (!summaries.isEmpty()) {
-            		String objectKey = ((S3ObjectSummary)summaries.get(0)).getKey();
-                    // Ignore files that won't have text in them
-            		objectKey = URLDecoder.decode(objectKey.replace('+', ' '), "UTF-8");
-                    String extension = objectKey.substring(objectKey.lastIndexOf(".") + 1);           		
-                    String[] extensions = {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "json", "html", "htm", "xml", "txt", "ps", "rtf"};
-                    boolean containsExtension = Arrays.stream(extensions).anyMatch(extension::equals);
-                    
-                    if (containsExtension) {
-                      _logger.log("Extract file " + objectKey);
-                      parseObjectText(objectKey, s3Client, bucket);
-                    }            		
-            	} else {
-            		_logger.log("No S3 objects w/prefix " + s3ObjectPrefix + " found.");
-            	}
-            	
-            }
-            
-        } catch (IOException | ParseException  e) {
-            _logger.log("Exception: " + e.getLocalizedMessage());
-            throw new RuntimeException(e);
-        }
-        return "Success";
-    }
+			String bucket = record.getS3().getBucket().getName();
 
-    private String extractText(String bucket, String key, InputStream objectData) throws IOException, TransformerConfigurationException, SAXException {
-      _logger.log("Extracting text with Tika");
-      String extractedText = "";
+			String json_key = URLDecoder.decode(record.getS3().getObject().getKey().replace('+', ' '), "UTF-8");
 
-      SAXTransformerFactory factory = (SAXTransformerFactory)SAXTransformerFactory.newInstance();
-      TransformerHandler handler = factory.newTransformerHandler();
-      handler.getTransformer().setOutputProperty(OutputKeys.METHOD, "text");
-      handler.getTransformer().setOutputProperty(OutputKeys.INDENT, "yes");
-      StringWriter sw = new StringWriter();
-      handler.setResult(new StreamResult(sw));
-      AutoDetectParser parser = new AutoDetectParser();
-      ParseContext parseContext = new ParseContext();
-      parseContext.set(Parser.class, parser);
+			AmazonS3 s3Client = new AmazonS3Client();
+			S3Object masterJsonObject = s3Client.getObject(new GetObjectRequest(bucket, json_key));
+			S3ObjectInputStream s3Stream = masterJsonObject.getObjectContent();
+			JSONParser jsonParser = new JSONParser();
+			JSONObject s3Json = (JSONObject) jsonParser.parse(new InputStreamReader(s3Stream, "UTF-8"));
 
-      Tika tika = new Tika();
-      Metadata tikaMetadata = new Metadata();
-      try {
-        parser.parse(objectData, handler, tikaMetadata, parseContext);
-        extractedText = sw.toString();
-      } catch( TikaException e) {
-        _logger.log("TikaException thrown while parsing: " + e.getLocalizedMessage());
-        return assembleExceptionResult(bucket, key, e);
-      }
-      _logger.log("Tika parsing success");
-      return assembleExtractionResult(bucket, key, extractedText, tikaMetadata);
-    }
+			String courseUrl = s3Json.get("url").toString();
+			String coursePrefix = courseUrl.substring(courseUrl.lastIndexOf("/") + 1);
 
-    private String assembleExtractionResult(String bucket, String key, String extractedText, Metadata tikaMetadata) {
+			String[] fileSections = { "course_files", "course_foreign_files" };
+			for (String section : fileSections) {
+				JSONArray courseFiles = (JSONArray) s3Json.get(section);
+				Iterator courseFilesIterator = courseFiles.iterator();
 
-      JSONObject extractJson = new JSONObject();
+				while (courseFilesIterator.hasNext()) {
+					Map<String, String> courseFile = ((Map<String, String>) courseFilesIterator.next());
+					String file_uid = courseFile.get("uid");
+					if (file_uid == null) {
+						file_uid = courseFile.get("link");
+						file_uid = file_uid.substring(file_uid.lastIndexOf("/") + 1);
+					}
+					String s3ObjectPrefix = coursePrefix + "/" + file_uid;
+					ObjectListing listing = s3Client.listObjects(bucket, s3ObjectPrefix);
+					List<S3ObjectSummary> summaries = listing.getObjectSummaries();
 
-      String contentType = tikaMetadata.get("Content-Type");
-      contentType = contentType != null ? contentType : "content/unknown";
+					if (!summaries.isEmpty()) {
+						S3ObjectSummary summary = summaries.get(0);
+						String objectKey = summary.getKey();
+						// Ignore files that won't have text in them
+						objectKey = URLDecoder.decode(objectKey.replace('+', ' '), "UTF-8");
+						String extension = objectKey.substring(objectKey.lastIndexOf(".") + 1).toLowerCase();
+						String[] extensions = { "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "json", "html",
+								"htm", "xml", "txt", "ps", "rtf", "srt", "json" };
+						boolean containsExtension = Arrays.stream(extensions).anyMatch(extension::equals);
 
-      String contentLength = tikaMetadata.get("Content-Length");
-      contentLength = contentLength != null ? contentLength : "0";
+						if (containsExtension) {
+							_logger.log("Extract file " + objectKey);
+							parseObjectText(s3Client, bucket, objectKey, s3Json, courseFile);
+						}
+					} else {
+						_logger.log("No S3 objects w/prefix " + s3ObjectPrefix + " found.");
+					}
 
-      extractJson.put("Exception", null);
-      extractJson.put("FilePath", "s3://" + bucket + "/" + key);
-      extractJson.put("Text", extractedText);
-      extractJson.put("ContentType", contentType);
-      extractJson.put("ContentLength", contentLength);
+				}
+			}
 
-      JSONObject metadataJson = new JSONObject();
+		} catch (IOException | ParseException e) {
+			_logger.log("Exception: " + e.getLocalizedMessage());
+			throw new RuntimeException(e);
+		}
+		return "Success";
+	}
 
-      for( String name : tikaMetadata.names() ){
-        String[] elements = tikaMetadata.getValues(name);
-        String joined = String.join(", ", elements);
-        metadataJson.put(name, joined);
-      }
+	private JSONObject extractText(String bucket, String key, InputStream objectData)
+			throws IOException, TransformerConfigurationException, SAXException {
+		/*
+		 * Use Tika to extract text from an S3 object
+		 */
 
-      extractJson.put("Metadata", metadataJson);
+		_logger.log("Extracting text with Tika");
+		String extractedText = "";
 
-      return extractJson.toJSONString();
-    }
+		SAXTransformerFactory factory = (SAXTransformerFactory) SAXTransformerFactory.newInstance();
+		TransformerHandler handler = factory.newTransformerHandler();
+		handler.getTransformer().setOutputProperty(OutputKeys.METHOD, "text");
+		handler.getTransformer().setOutputProperty(OutputKeys.INDENT, "yes");
+		StringWriter sw = new StringWriter();
+		handler.setResult(new StreamResult(sw));
+		AutoDetectParser parser = new AutoDetectParser();
+		ParseContext parseContext = new ParseContext();
+		parseContext.set(Parser.class, parser);
 
-    private String assembleExceptionResult(String bucket, String key, Exception e){
-      JSONObject exceptionJson = new JSONObject();
+		Tika tika = new Tika();
+		Metadata tikaMetadata = new Metadata();
+		try {
+			parser.parse(objectData, handler, tikaMetadata, parseContext);
+			extractedText = sw.toString();
+		} catch (TikaException e) {
+			_logger.log("TikaException thrown while parsing: " + e.getLocalizedMessage());
+			return assembleExceptionResult(bucket, key, e);
+		}
+		_logger.log("Tika parsing success");
+		return assembleExtractionResult(bucket, key, extractedText, tikaMetadata);
+	}
 
-      exceptionJson.put("Exception", e.getLocalizedMessage());
-      exceptionJson.put("FilePath", "s3://" + bucket + "/" + key);
-      exceptionJson.put("ContentType", "unknown");
-      exceptionJson.put("ContentLength", "0");
-      exceptionJson.put("Text", "");
+	private JSONObject assembleExtractionResult(String bucket, String key, String extractedText,
+			Metadata tikaMetadata) {
+		/*
+		 *  Generate a JSON object containing extracted text and relevant metadata
+		 */
+		
+		JSONObject extractJson = new JSONObject();
 
-      JSONObject metadataJson = new JSONObject();
-      metadataJson.put("resourceName", "s3://" + bucket + "/" + key);
+		String contentType = tikaMetadata.get("Content-Type");
+		contentType = contentType != null ? contentType : "content/unknown";
 
-      exceptionJson.put("Metadata", metadataJson);
+		String contentLength = tikaMetadata.get("Content-Length");
+		contentLength = contentLength != null ? contentLength : "0";
 
-      return exceptionJson.toJSONString();
-    }
+		extractJson.put("Exception", null);
+		extractJson.put("FilePath", "s3://" + bucket + "/" + key);
+		extractJson.put("Text", extractedText);
+		extractJson.put("ContentType", contentType);
+		extractJson.put("ContentLength", contentLength);
+
+		JSONObject metadataJson = new JSONObject();
+
+		for (String name : tikaMetadata.names()) {
+			String[] elements = tikaMetadata.getValues(name);
+			String joined = String.join(", ", elements);
+			metadataJson.put(name, joined);
+		}
+
+		extractJson.put("Metadata", metadataJson);
+
+		return extractJson;
+	}
+
+	private JSONObject assembleExceptionResult(String bucket, String key, Exception e) {
+		/*
+		 * Generate a JSON object containing info on what went wrong during text extraction.
+		 */
+		
+		JSONObject exceptionJson = new JSONObject();
+
+		exceptionJson.put("Exception", e.getLocalizedMessage());
+		exceptionJson.put("FilePath", "s3://" + bucket + "/" + key);
+		exceptionJson.put("ContentType", "unknown");
+		exceptionJson.put("ContentLength", "0");
+		exceptionJson.put("Text", "");
+
+		JSONObject metadataJson = new JSONObject();
+		metadataJson.put("resourceName", "s3://" + bucket + "/" + key);
+
+		exceptionJson.put("Metadata", metadataJson);
+
+		return exceptionJson;
+	}
 }
